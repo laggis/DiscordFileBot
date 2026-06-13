@@ -1,26 +1,22 @@
 "use strict";
 
 // ─── State ────────────────────────────────────────────────────────────────────
-let secret = "";
+// NOTE: No secret is ever stored here. Auth is handled by an httpOnly cookie
+// that the browser manages automatically — JavaScript cannot read it.
 let resources = [];
 let editingId = null;
 let guildId = null;
+let lockoutInterval = null;
 
 // ─── Boot ─────────────────────────────────────────────────────────────────────
 window.addEventListener("DOMContentLoaded", () => {
-  // Restore session if the user previously logged in
-  const saved = sessionStorage.getItem("panel_secret");
-  if (saved) {
-    secret = saved;
-    boot();
-  }
+  // Try to resume an existing session (the browser sends the cookie automatically)
+  boot();
 
-  // Enter key submits login
   document.getElementById("secret-input").addEventListener("keydown", (e) => {
     if (e.key === "Enter") login();
   });
 
-  // Click outside modal card to close
   document.getElementById("edit-modal").addEventListener("click", (e) => {
     if (e.target === e.currentTarget) closeEdit();
   });
@@ -28,15 +24,13 @@ window.addEventListener("DOMContentLoaded", () => {
 
 async function boot() {
   try {
-    await loadStatus();
+    await loadStatus(); // 401 if no valid session → caught below
   } catch {
-    // Secret wrong or panel not reachable — go back to login
     return showLogin();
   }
   document.getElementById("login").classList.add("hidden");
   document.getElementById("app").classList.remove("hidden");
   await loadResources();
-  // Refresh bot status every 30 s
   setInterval(loadStatus, 30_000);
 }
 
@@ -44,56 +38,120 @@ async function boot() {
 async function login() {
   const input = document.getElementById("secret-input");
   const errEl = document.getElementById("login-error");
+  const btn = document.getElementById("login-btn");
+  const secret = input.value.trim();
 
-  secret = input.value.trim();
   errEl.classList.add("hidden");
 
   if (!secret) {
-    errEl.textContent = "Please enter your secret.";
-    errEl.classList.remove("hidden");
+    showLoginError("Please enter your secret.");
     return;
   }
 
+  btn.disabled = true;
+  btn.textContent = "Signing in…";
+
   try {
-    await loadStatus();
-    sessionStorage.setItem("panel_secret", secret);
+    const res = await fetch("/api/login", {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ secret }),
+    });
+
+    const data = await res.json();
+
+    if (!res.ok) {
+      showLoginError(data.error || "Login failed.");
+
+      // Start countdown if we hit the lockout
+      if (res.status === 429 && data.lockedUntil) {
+        startLockoutCountdown(data.lockedUntil);
+      }
+      return;
+    }
+
+    // Success — clear the input and launch the app
+    input.value = "";
+    clearLockout();
     boot();
   } catch {
-    secret = "";
-    errEl.textContent = "Invalid secret — please try again.";
-    errEl.classList.remove("hidden");
-    input.value = "";
-    input.focus();
+    showLoginError("Could not reach the server. Is the bot running?");
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "Sign In";
   }
 }
 
-function showLogin() {
-  document.getElementById("login").classList.remove("hidden");
-  document.getElementById("app").classList.add("hidden");
-}
-
-function logout() {
-  sessionStorage.removeItem("panel_secret");
-  secret = "";
-  resources = [];
-  guildId = null;
+async function logout() {
+  try {
+    await fetch("/api/logout", { method: "POST", credentials: "same-origin" });
+  } catch {
+    /* best-effort */
+  }
   showLogin();
 }
 
+function showLogin() {
+  resources = [];
+  guildId = null;
+  clearLockout();
+  document.getElementById("login").classList.remove("hidden");
+  document.getElementById("app").classList.add("hidden");
+  document.getElementById("secret-input").focus();
+}
+
+// ─── Lockout countdown ────────────────────────────────────────────────────────
+function startLockoutCountdown(lockedUntil) {
+  clearLockout();
+  const btn = document.getElementById("login-btn");
+  btn.disabled = true;
+
+  function tick() {
+    const secsLeft = Math.ceil((lockedUntil - Date.now()) / 1000);
+    if (secsLeft <= 0) {
+      clearLockout();
+      showLoginError("Lockout expired — you may try again.");
+      return;
+    }
+    const m = String(Math.floor(secsLeft / 60)).padStart(2, "0");
+    const s = String(secsLeft % 60).padStart(2, "0");
+    showLoginError(`Too many failed attempts. Try again in ${m}:${s}.`);
+  }
+
+  tick();
+  lockoutInterval = setInterval(tick, 1000);
+}
+
+function clearLockout() {
+  clearInterval(lockoutInterval);
+  lockoutInterval = null;
+  const btn = document.getElementById("login-btn");
+  if (btn) btn.disabled = false;
+}
+
+function showLoginError(msg) {
+  const el = document.getElementById("login-error");
+  el.textContent = msg;
+  el.classList.remove("hidden");
+}
+
 // ─── API helper ───────────────────────────────────────────────────────────────
+// The session cookie is sent automatically by the browser (same-origin).
+// No secret is ever placed in a JavaScript variable or request header.
 async function api(method, url, body = null) {
   const res = await fetch(url, {
     method,
-    headers: {
-      "Content-Type": "application/json",
-      "X-Panel-Secret": secret,
-    },
+    credentials: "same-origin",
+    headers: { "Content-Type": "application/json" },
     body: body ? JSON.stringify(body) : undefined,
   });
 
   if (res.status === 401) {
-    logout();
-    throw new Error("Unauthorized");
+    // Session expired server-side — send user back to login
+    showLogin();
+    toast("Session expired — please log in again.", "info");
+    throw new Error("Session expired");
   }
 
   const data = await res.json();
@@ -127,7 +185,7 @@ async function loadResources() {
     updateStats();
     renderTable(resources);
   } catch (err) {
-    toast(err.message, "error");
+    if (err.message !== "Session expired") toast(err.message, "error");
   }
 }
 
@@ -198,7 +256,6 @@ function renderTable(list) {
     tbody.appendChild(tr);
   }
 
-  // Attach button listeners after DOM insertion (avoids inline JS with IDs)
   tbody
     .querySelectorAll("[data-edit]")
     .forEach((btn) =>
@@ -244,7 +301,6 @@ function openEdit(id) {
   document.getElementById("edit-direct-url").value = r.direct_url || "";
   document.getElementById("edit-category").value = r.category || "";
 
-  // Show remaining hours (0 = unlimited)
   if (!r.expires_at) {
     document.getElementById("edit-expiry").value = "0";
   } else {
@@ -262,7 +318,6 @@ function closeEdit() {
   document.getElementById("edit-modal").classList.add("hidden");
 }
 
-// Called by the form's onsubmit
 async function saveEdit(e) {
   e.preventDefault();
   const btn = document.getElementById("save-btn");
@@ -279,12 +334,11 @@ async function saveEdit(e) {
       category: document.getElementById("edit-category").value.trim(),
       expirationHours: isNaN(expiryVal) ? 0 : expiryVal,
     });
-
     toast("Resource updated successfully!");
     closeEdit();
     await loadResources();
   } catch (err) {
-    toast(err.message, "error");
+    if (err.message !== "Session expired") toast(err.message, "error");
   } finally {
     btn.disabled = false;
     btn.textContent = "Save Changes";
@@ -306,10 +360,9 @@ async function doDelete(id) {
     toast("Resource deleted.");
     resources = resources.filter((r) => r.id !== id);
     updateStats();
-    // Re-render respecting any active search filter
     filterResources();
   } catch (err) {
-    toast(err.message, "error");
+    if (err.message !== "Session expired") toast(err.message, "error");
   }
 }
 
@@ -327,7 +380,7 @@ async function triggerSync() {
     );
     await loadResources();
   } catch (err) {
-    toast(err.message, "error");
+    if (err.message !== "Session expired") toast(err.message, "error");
   } finally {
     btn.disabled = false;
     btn.textContent = "🔄 Sync";
