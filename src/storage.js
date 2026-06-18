@@ -13,6 +13,11 @@ const ARCHIVE_EXTS = ['.zip', '.rar', '.7z', '.tar', '.gz'];
  * Otherwise returns a plain direct link.
  */
 function generateUrl(filename, expiration = config.linkExpirationSeconds) {
+  if (!filename) {
+    console.error('[storage] generateUrl called with empty filename');
+    return null;
+  }
+
   if (!config.iis.baseUrl) {
     console.error('IIS_BASE_URL is not configured.');
     return null;
@@ -34,8 +39,7 @@ function generateUrl(filename, expiration = config.linkExpirationSeconds) {
     .update(dataToSign)
     .digest('hex');
 
-  const delimiter = config.iis.baseUrl.includes('?') ? '&' : '?';
-  return `${config.iis.baseUrl}${delimiter}file=${safeFilename}&expires=${expiresAt}&signature=${signature}`;
+  return `${config.iis.baseUrl}/${safeFilename}?expires=${expiresAt}&signature=${signature}`;
 }
 
 // ─── Local File Helpers ───────────────────────────────────────────────────────
